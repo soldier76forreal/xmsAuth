@@ -141,9 +141,7 @@ router.post("/register" , upload.single("images") , verify , async(req,res)=>{
             const existingPhoneNumber = await userM.findOne({phoneNumber:req.body.phoneNumber});
             if(existingPhoneNumber){
                 res.status(400).send("شماره تلفن تکراری است");
-            }else{
-                  
-                
+            }else{                
                 //hash password
                 const salt = await bcrypt.genSalt(10);
                 const hashPassword = await bcrypt.hash(req.body.password , salt);
@@ -158,7 +156,7 @@ router.post("/register" , upload.single("images") , verify , async(req,res)=>{
                 })
                 try{
                     const saveUser = await newUser.save();
-                    res.send(200);
+                    res.status(200).send(saveUser);
                 }catch(err){
                     res.status(400).send(err);
                 }
@@ -213,7 +211,7 @@ router.post("/login" , async(req,res)=>{
 
 
 router.post('/refreshToken' , (req , res)=>{
-  if(!req.cookies.refreshToken || !refreshTokens.includes(req.cookies.refreshToken)){
+  if(!req.cookies.refreshToken){
     return res.status(401).send('در دسترس نیست');
  }else{ 
         jwt.verify(req.cookies.refreshToken , process.env.TOKEN_SECRET_REF , (error ,user) =>{
@@ -230,7 +228,33 @@ router.post('/refreshToken' , (req , res)=>{
 
 });
 
+router.post('/updateUser', upload.single("images") , verify , async(req , res)=>{
+    
+  try{
+      if(req.body.images === undefined){
+        const updateUser = await userM.findOneAndUpdate({_id:req.body.userId}, 
+            {$set:{                    
+                'firstName' : req.body.firstName,
+                'lastName' : req.body.lastName,
+                'access' : req.body.access
+              }});
+        res.status(200).send('user has been updated...')
 
+      }else if(req.body.images !== undefined){
+        const updateUser = await userM.findOneAndUpdate({_id:req.body.userId}, 
+          {$set:{                    
+              'firstName' : req.body.firstName,
+              'lastName' : req.body.lastName,
+              'access' : req.body.access,
+              'profileImage':req.file
+            }});
+        res.status(200).send('user has been updated...')
+      }
+     
+    }catch(err){
+        console.log(err)
+    }
+})
 
 router.post('/deleteRefreshToken' , (req , res)=>{
   res.status(200).clearCookie('refreshToken').send("refresh cookie cleared!");

@@ -18,6 +18,7 @@ const userSchema = new mongoose.Schema ({
     oldPasswords:{type:Array},
     passwordReset:{type:Array},
     savedPost:{type:Array},
+    filterMemory:{crm:{sort:{type:String , default:null},filter:[{type:String , default:null}]}},
     insertDate : {type:Date , default:Date.now},
     updateDate : {type:Date , default:null},
     deleteDate : {type:Date , default:null}

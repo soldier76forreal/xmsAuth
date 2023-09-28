@@ -180,8 +180,8 @@ router.post("/login" , async(req,res)=>{
           }else{
             if(user.validation === true){
               //creat and assign a token
-              let accessToken = jwt.sign({id:user._id , firstName:user.firstName , profileImage:user.profileImage , lastName:user.lastName , access:user.access} , process.env.TOKEN_SECRET , {expiresIn : '3m'} );
-              let refreshToken = jwt.sign({id:user._id , firstName:user.firstName , profileImage:user.profileImage , lastName:user.lastName , access:user.access} , process.env.TOKEN_SECRET_REF , {expiresIn : '180d'});
+              let accessToken = jwt.sign({id:user._id , firstName:user.firstName , profileImage:user.profileImage , lastName:user.lastName , access:user.access , filterMemory:user.filterMemory} , process.env.TOKEN_SECRET , {expiresIn : '3m'} );
+              let refreshToken = jwt.sign({id:user._id , firstName:user.firstName , profileImage:user.profileImage , lastName:user.lastName , access:user.access , filterMemory:user.filterMemory} , process.env.TOKEN_SECRET_REF , {expiresIn : '180d'});
               refreshTokens.push(refreshToken);
               return res.status(200).cookie('refreshToken' , refreshToken , {
                 sameSite:'strict',
@@ -216,7 +216,7 @@ router.post('/refreshToken' , (req , res)=>{
  }else{ 
         jwt.verify(req.cookies.refreshToken , process.env.TOKEN_SECRET_REF , (error ,user) =>{
           if(!error){ 
-            const accessToken = jwt.sign({id:user.id , firstName:user.firstName , profileImage:user.profileImage , lastName:user.lastName , access:user.access} ,process.env.TOKEN_SECRET ,{expiresIn:'3m'});
+            const accessToken = jwt.sign({id:user.id , firstName:user.firstName , profileImage:user.profileImage , lastName:user.lastName , access:user.access ,filterMemory:user.filterMemory} ,process.env.TOKEN_SECRET ,{expiresIn:'3m'});
            
             return res.status(200).send({accessToken:accessToken});
           }else{

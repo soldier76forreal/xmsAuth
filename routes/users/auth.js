@@ -1,400 +1,386 @@
 const express = require('express');
-const mongoose = require("mongoose");
-const bcrypt = require("bcryptjs");
-const nodemailer = require('nodemailer');
-const userModel = require('../../models/userModel');
-const jwt = require('jsonwebtoken'); 
+const crypto  = require('crypto');
+const https   = require('https');
+const mongoose = require('mongoose');
+const bcrypt  = require('bcryptjs');
+const jwt     = require('jsonwebtoken');
+const multer  = require('multer');
+
+const userModel    = require('../../models/userModel');
 const dbConnection = require('../../connections/xmsPr');
-const smtpTransport = require('nodemailer-smtp-transport');
+const verify       = require('./verifyToken');
+const crashLogger  = require('../../utils/crashLogger');
+
 const router = express.Router();
-const jwt_decode = require('jwt-decode');
-const verify = require('./verifyToken');
-const multer = require('multer');
 
-var fs = require('fs');
-var maxSize = 1 * 1000 * 1000;
-const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        cb(null,"public/uploads");
-    },
-    limits: { fileSize: maxSize },
-    filename: function (req, file, cb) {
-        cb(null, file.fieldname + '-' + Date.now() + file.originalname.match(/\..*$/)[0])
-    }
-  })
+// ── Rate limit constants ──────────────────────────────────────────────────────
+const COOLDOWN_MS       = 60  * 1000;        // 60s between sends (per phone)
+const PHONE_WINDOW_MS   = 30  * 60 * 1000;   // 30-min rolling window (per phone)
+const PHONE_MAX_SENDS   = 5;                  // max sends per window (per phone)
+const IP_WINDOW_MS      = 30  * 60 * 1000;   // 30-min rolling window (per IP)
+const IP_MAX_SENDS      = 5;                  // max sends per window (per IP)
+const LOCKOUT_DURATION  = 2   * 60 * 60 * 1000;  // 2h lockout after 5 failed verifies
+const MAX_VERIFY_FAILS  = 5;
 
-  const upload = multer({ storage: storage 
-})
+// ── Per-IP in-memory send throttle ───────────────────────────────────────────
+// Resets on server restart — acceptable since IP windows are 30 min.
+// Format: Map<ip, { count: Number, windowStart: Number (ms timestamp) }>
+const ipRateMap = new Map();
 
+function checkAndRecordIp(ip) {
+  const now = Date.now();
+  const entry = ipRateMap.get(ip);
 
-
-const transporter = nodemailer.createTransport(smtpTransport({
-  host:'mail.lazulitemarble.com',
-  secureConnection: false,
-  tls: {
-    rejectUnauthorized: false
-  },
-  port: 465,
-  auth: {
-      user: process.env.EMAIL_SEND_SESSION,
-      pass: process.env.EMAIL_SEND_PASSWORD,
+  if (!entry || now - entry.windowStart > IP_WINDOW_MS) {
+    ipRateMap.set(ip, { count: 1, windowStart: now });
+    return null;
+  }
+  if (entry.count >= IP_MAX_SENDS) {
+    const remainingMs  = IP_WINDOW_MS - (now - entry.windowStart);
+    const remainingMin = Math.ceil(remainingMs / 60000);
+    return remainingMin;  // non-null = blocked
+  }
+  entry.count++;
+  return null;
 }
-}));
 
-let refreshTokens = [];
-let refreshTokensForMain = [];
-const url = 'http://localhost:3000'
-const userM = dbConnection.model("user" ,userModel);
+// ── File upload (kept for /register profile image) ────────────────────────────
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, 'public/uploads'),
+  filename: (req, file, cb) =>
+    cb(null, file.fieldname + '-' + Date.now() + file.originalname.match(/\..*$/)[0]),
+});
+const upload = multer({ storage, limits: { fileSize: 1 * 1000 * 1000 } });
 
-//VALIDATION
+const userM = dbConnection.model('user', userModel);
 
-const joi = require("joi");
-const schema =joi.object({
-    firstName : joi.string().min(1).required(),
-    lastName : joi.string().min(1).required(),
-    // phoneNumber : joi.string().min(6).required().email().error(errors => {
-    //     errors.forEach(err => {
-    //       switch (err.code) {
-    //         case "any.empty":
-    //           err.message = "شماره تلفن را وارد کنید";
-    //           break;
-    //         default:"شماره تلفن معتبر نیست"
-    //           break;
-    //       }
-    //     });
-    //     return errors;
-    //   }),
-    password : joi.string().regex(/(?=.*\d)(?=.*[a-z])(?=.*[A-Z]).*/).min(8).required().error(errors => {
-        errors.forEach(err => {
-          switch (err.code) {
-            case "any.empty":
-                err.message = "کلمه عبور معتبر نیست";
-                break;
-            case "string.pattern.base":
-                err.message = "کلمه عبور باید دارای حروف بزرگ و عدد باشد";
-                break;
-            case "string.min":
-                err.message = `رمز عبور باید حداقل ${err.local.limit} کاراکتر باشد`; 
-            default:"ایمیل معتبر نیست"
-              break;
+// ── Token payload factory ─────────────────────────────────────────────────────
+const tokenPayload = (user) => ({
+  id: user._id,
+  firstName: user.firstName,
+  profileImage: user.profileImage,
+  lastName: user.lastName,
+  access: user.access,
+  filterMemory: user.filterMemory,
+});
+
+const issueTokens = (user, res) => {
+  const payload = tokenPayload(user);
+  const accessToken  = jwt.sign(payload, process.env.TOKEN_SECRET,     { expiresIn: '3m'   });
+  const refreshToken = jwt.sign(payload, process.env.TOKEN_SECRET_REF, { expiresIn: '180d' });
+
+  return res.status(200).cookie('refreshToken', refreshToken, {
+    sameSite: 'strict',
+    path: '/',
+    secure: true,
+    expires: new Date(Date.now() + 4320 * 60 * 60 * 1000),
+    httpOnly: true,
+  }).json({ accessToken });
+};
+
+// ── sms.ir OTP delivery ───────────────────────────────────────────────────────
+async function sendOtpViaSmsIr(mobile, otp) {
+  const body = JSON.stringify({
+    mobile,
+    templateId: Number(process.env.SMSIR_OTP_TEMPLATE_ID),
+    parameters: [{
+      name:  process.env.SMSIR_OTP_PARAM_NAME || 'Code',
+      value: String(otp),
+    }],
+  });
+
+  const verifyUrl = new URL(
+    process.env.SMSIR_VERIFY_URL || 'https://api.sms.ir/v1/send/verify'
+  );
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: verifyUrl.hostname,
+        path:     verifyUrl.pathname,
+        method:   'POST',
+        headers: {
+          'x-api-key':      process.env.SMSIR_API_KEY,
+          'Content-Type':   'application/json',
+          'Accept':         'text/plain',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      (resp) => {
+        let data = '';
+        resp.on('data', (chunk) => { data += chunk; });
+        resp.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.status !== 1) {
+              reject(new Error(`sms.ir: ${parsed.message}`));
+            } else {
+              resolve(parsed);
+            }
+          } catch {
+            reject(new Error('sms.ir: invalid response'));
           }
         });
-        return errors;
-      })
-})
-
-
-//password checker
-const passwordChecker =joi.object({
-  password : joi.string().regex(/(?=.*\d)(?=.*[a-z])(?=.*[A-Z]).*/).min(8).required().error(errors => {
-      errors.forEach(err => {
-        switch (err.code) {
-          case "any.empty":
-              err.message = "کلمه عبور معتبر نیست";
-              break;
-          case "string.pattern.base":
-              err.message = "کلمه عبور باید دارای حروف بزرگ و عدد باشد";
-              break;
-          case "string.min":
-              err.message = `رمز عبور باید حداقل ${err.local.limit} کاراکتر باشد`; 
-          default:"کلمه عبور معتبر نیست"
-            break;
-        }
-      });
-      return errors;
-    })
-
-})
-
-
-const loginSchema = joi.object({
-  email : joi.string().min(6).required().email().error(errors => {
-    errors.forEach(err => {
-      switch (err.code) {
-        case "any.empty":
-          err.message = "ایمیل معتبر نیست";
-          break;
-        case "string.min":
-          err.message = `ایمیل معتبر نیست`;
-          break;
-        case "string.email":
-          err.message = `ایمیل معتبر نیست`;
-          break;
-        default:"ایمیل معتبر نیست"
-          break;
       }
-    });
-    return errors;
-  })
-})
+    );
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
 
-
-
-
-//auth routes
-router.post("/register" , upload.single("images") , verify , async(req,res)=>{
-    // validate infor before sending to data base
-          // const error =  schema.validate(req.body);
-          // if(error.error){
-          //   res.status(400).send(error.error.details[0].message);
-          // }else{
-            const existingPhoneNumber = await userM.findOne({phoneNumber:req.body.phoneNumber});
-            if(existingPhoneNumber){
-                res.status(400).send("شماره تلفن تکراری است");
-            }else{                
-                //hash password
-                const salt = await bcrypt.genSalt(10);
-                const hashPassword = await bcrypt.hash(req.body.password , salt);
-                const newUser = new userM({
-                    firstName : req.body.firstName,
-                    lastName : req.body.lastName,
-                    phoneNumber : req.body.phoneNumber,
-                    profileImage:req.file,
-                    password : hashPassword,
-                    validation : false,
-                    access: req.body.access
-                })
-                try{
-                    const saveUser = await newUser.save();
-                    res.status(200).send(saveUser);
-                }catch(err){
-                    res.status(400).send(err);
-                }
-          }
-        // }
-    
-})
-
-router.post("/login" , async(req,res)=>{
-    //check if email is correct
-  if(req.body.phoneNumber !== '' && req.body.password !== ''){
-      const user = await userM.findOne({phoneNumber:req.body.phoneNumber});
-      
-      if(!user){
-          res.status(400).send("شماره تلفن یا کلمه عبور اشتباه است");
-      }else{
-              //check if password is correct
-          const validPassword = await bcrypt.compare(req.body.password , user.password);
-          if(!validPassword) {
-              res.status(400).send("شماره تلفن یا کلمه عبور اشتباه است");
-          }else{
-            if(user.validation === true){
-              //creat and assign a token
-              let accessToken = jwt.sign({id:user._id , firstName:user.firstName , profileImage:user.profileImage , lastName:user.lastName , access:user.access , filterMemory:user.filterMemory} , process.env.TOKEN_SECRET , {expiresIn : '3m'} );
-              let refreshToken = jwt.sign({id:user._id , firstName:user.firstName , profileImage:user.profileImage , lastName:user.lastName , access:user.access , filterMemory:user.filterMemory} , process.env.TOKEN_SECRET_REF , {expiresIn : '180d'});
-              refreshTokens.push(refreshToken);
-              return res.status(200).cookie('refreshToken' , refreshToken , {
-                sameSite:'strict',
-                path:'/',
-                secure:true,
-                expires:new Date(new Date().getTime() + 4320*60*60*1000),
-                httpOnly:true
-              }).send({
-                accessToken
-              })
-              // const token = jwt.sign({id:user._id , firstName:user.firstName , profileImage:user.profileImage , lastName:user.lastName , role:user.role} , process.env.TOKEN_SECRET);
-              // res.header("auth_token" , token ).send(token);
-              }else{
-                res.status(401).send("عدم دسترسی");
-              }
-          }
-      }
-
-
-  }else{
-    res.status(400).send("شماره تلفن یا کلمه عبورو وارد نکردید");
-
+// ── POST /auth/requestOtp ─────────────────────────────────────────────────────
+router.post('/requestOtp', async (req, res) => {
+  const { phoneNumber } = req.body;
+  if (!phoneNumber) {
+    return res.status(400).json({ message: 'شماره تلفن را وارد کنید' });
   }
-})
 
+  // ① Per-IP throttle (checked before DB hit)
+  const clientIp = req.ip || req.connection.remoteAddress || 'unknown';
+  const ipBlockedMin = checkAndRecordIp(clientIp);
+  if (ipBlockedMin !== null) {
+    return res.status(429).json({
+      message: `تعداد درخواست‌ها بیش از حد مجاز. ${ipBlockedMin} دقیقه دیگر تلاش کنید`,
+    });
+  }
 
-
-
-router.post('/refreshToken' , (req , res)=>{
-  if(!req.cookies.refreshToken){
-    return res.status(401).send('در دسترس نیست');
- }else{ 
-        jwt.verify(req.cookies.refreshToken , process.env.TOKEN_SECRET_REF , (error ,user) =>{
-          if(!error){ 
-            const accessToken = jwt.sign({id:user.id , firstName:user.firstName , profileImage:user.profileImage , lastName:user.lastName , access:user.access ,filterMemory:user.filterMemory} ,process.env.TOKEN_SECRET ,{expiresIn:'3m'});
-           
-            return res.status(200).send({accessToken:accessToken});
-          }else{
-            console.log(error)
-            return res.status(401).send('در دسترس نیست');
-          }
-        });     
- }
-
-});
-
-router.post('/updateUser', upload.single("images") , verify , async(req , res)=>{
-    
-  try{
-    var temp = []
-        for(var i = 0 ; req.body.access.length > i ; i++){
-          // temp.push(req.body.access[i].id)
-
-        }
-        
-      
-      console.log(temp)
-      if(req.body.images === undefined){
-        
-        const updateUser = await userM.findOneAndUpdate({_id:req.body.userId}, 
-            {$set:{                    
-                'firstName' : req.body.firstName,
-                'lastName' : req.body.lastName,
-                'access' : temp
-              }});
-        res.status(200).send('user has been updated...')
-
-      }else if(req.body.images !== undefined){
-        const updateUser = await userM.findOneAndUpdate({_id:req.body.userId}, 
-          {$set:{                    
-              'firstName' : req.body.firstName,
-              'lastName' : req.body.lastName,
-              'access' : temp,
-              'profileImage':req.file
-            }});
-        res.status(200).send('user has been updated...')
-      }
-     
-    }catch(err){
-        console.log(err)
+  try {
+    const user = await userM.findOne({ phoneNumber, deleteDate: null });
+    if (!user) {
+      return res.status(404).json({ message: 'کاربر یافت نشد' });
     }
-})
+    if (user.validation !== true) {
+      return res.status(403).json({ message: 'حساب کاربری فعال نیست' });
+    }
 
-router.post('/deleteRefreshToken' , (req , res)=>{
-  res.status(200).clearCookie('refreshToken').send("refresh cookie cleared!");
+    const now  = new Date();
+    const auth = user.auth || {};
 
+    // ② Account lockout check
+    if (auth.lockedUntil && auth.lockedUntil > now) {
+      const remainingMin = Math.ceil((auth.lockedUntil - now) / 60000);
+      return res.status(423).json({
+        message: `حساب قفل شده است. ${remainingMin} دقیقه دیگر تلاش کنید`,
+        lockedUntil: auth.lockedUntil,
+      });
+    }
+
+    // ③ Per-phone 60s cooldown
+    if (auth.otpLastSentAt) {
+      const msSinceLast = now - new Date(auth.otpLastSentAt);
+      if (msSinceLast < COOLDOWN_MS) {
+        const remainingS = Math.ceil((COOLDOWN_MS - msSinceLast) / 1000);
+        return res.status(429).json({
+          message: `${remainingS} ثانیه دیگر تلاش کنید`,
+          cooldownSeconds: remainingS,
+        });
+      }
+    }
+
+    // ④ Per-phone max-sends-per-window check
+    const inWindow = auth.otpWindowStart &&
+      (now - new Date(auth.otpWindowStart)) < PHONE_WINDOW_MS;
+    if (inWindow && (auth.otpSendCount || 0) >= PHONE_MAX_SENDS) {
+      const remainingMin = Math.ceil(
+        (PHONE_WINDOW_MS - (now - new Date(auth.otpWindowStart))) / 60000
+      );
+      return res.status(429).json({
+        message: `حداکثر تعداد ارسال در این بازه زمانی. ${remainingMin} دقیقه دیگر تلاش کنید`,
+      });
+    }
+
+    // ⑤ Generate OTP, hash it, update user
+    const otp          = String(crypto.randomInt(100000, 999999));
+    const salt         = await bcrypt.genSalt(10);
+    const otpHash      = await bcrypt.hash(otp, salt);
+    const otpExpiresAt = new Date(now.getTime() + 3 * 60 * 1000);  // 3 min
+
+    await userM.updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          'auth.otpHash':        otpHash,
+          'auth.otpExpiresAt':   otpExpiresAt,
+          'auth.otpLastSentAt':  now,
+          'auth.otpSendCount':   inWindow ? (auth.otpSendCount || 0) + 1 : 1,
+          'auth.otpWindowStart': inWindow ? auth.otpWindowStart : now,
+        },
+      }
+    );
+
+    // ⑥ Deliver via sms.ir (DEV: OTP also printed to console for testing)
+    console.log(`[DEV] OTP for ${phoneNumber}: ${otp}`);
+    try {
+      await sendOtpViaSmsIr(phoneNumber, otp);
+    } catch (smsErr) {
+      crashLogger.logError(smsErr, { type: 'smsIrError', phoneNumber });
+      // DEV: don't block login if SMS fails — OTP is in the console above
+      // TODO: restore the 502 return below when sms.ir is confirmed working
+      // return res.status(502).json({ message: 'ارسال کد ناموفق بود، لطفاً دوباره امتحان کنید' });
+    }
+
+    return res.status(200).json({ message: 'کد تأیید ارسال شد' });
+
+  } catch (err) {
+    return res.status(500).json({ message: 'خطای سرور' });
+  }
 });
 
+// ── POST /auth/verifyOtp ──────────────────────────────────────────────────────
+router.post('/verifyOtp', async (req, res) => {
+  const { phoneNumber, otp } = req.body;
+  if (!phoneNumber || !otp) {
+    return res.status(400).json({ message: 'اطلاعات ناقص است' });
+  }
 
-// router.post('/forgetPassword' , async(req , res , next)=>{
-//   if(req.body.email !== ''){
-//     const user = await userM.findOne({email:req.body.email });
-//     if(!user){
-//         res.status(400).send("ایمیل معتبر نیست");
-//     }else{
-//       const oneTimeSecret = process.env.TOKEN_SECRET_RESETPASSWORD + user.password;
-//       const payload = {
-//         email: req.body.email,
-//         id:user._id
-//       }
-//       const token = jwt.sign(payload , oneTimeSecret , {expiresIn:'15m'});
-//       const link = `${url}/resetPassword/${user._id}/${token}`;
-//       transporter.sendMail(
-//         {
-//           from:"noreply@lazulitemarble.com",
-//           to:req.body.email,
-//           subject:'بازیابی کلمه عبور',
-//           text:link,
-//           html:
-//           `
-//             <div style="max-width: 800px;">
-//               <div style="text-align: center;">
-//                   <img style="max-width: 190px; text-align: center;" src="../../public/files/logoSam.png">
-//               </div>
-//               <div style="text-align: center; font-size: 24px;">
-//                   <h5 style="margin: 20px 0px 30px 0px; padding: 0px; color:rgb(61, 61, 61);">بازیابی کلمه عبور</h5>
-//               </div>
-//               <hr style="opacity: 0.5;">
-//               <div dir="rtl" style="padding: 0px 20px 0px 20px; text-align: right;">
-//                   <h5 style="font-size: 15px; color:rgb(61, 61, 61);">
-//                       کاربر گرامی: ${req.body.email}
-//                   </h5>
-//                   <h5 style="font-size: 15px; color:rgb(61, 61, 61);">
-//                       سلام
-//                   </h5>
-//                   <h5 style="font-size: 15px; color:rgb(61, 61, 61);">
-//                       این ایمیل به درخواست شما برای بازیابی کلمه عبور در لازولیت ماربل برای شما ارسال شده است.
-//                   </h5>
-//                   <h5 style="font-size: 15px; color:rgb(61, 61, 61);">
-//                       برای تغییر کلمه عبور لینک زیر را باز کنید:        
-//                   </h5>
-//                   <h5 style="font-size: 15px; color:rgb(61, 61, 61);">
-//                       لطفاً توجه داشته باشید، این لینک پس از 15 دقیقه منقضی خواهد شد.        
-//                   </h5>
-//               </div>
-//               <div style="width: 100%; margin: 30px 0px 0px 0px; text-align: center;">
-//                   <a href=${link} style="color:rgb(226, 226, 226); background-color: #354063; padding: 10px 8px 10px 8px; border-radius: 8px; font-weight: 700;">
-//                       بازیابی کلمه عبور 
-//                   </a>
-//               </div>
-//           </div>
-//           `
-//         },
-//         (err , info)=>{
-//           if(err){
-//             console.log(err);
-//             return
-//           }
-//           console.log("send" + info.response);
-//         }
-//       )
-//       res.status(200).send(link);
-//     }
-//   }else{
-//     res.status(400).send("ایمیل را وارد کنید");
-//   }
+  try {
+    const user = await userM.findOne({ phoneNumber, deleteDate: null });
+    if (!user) {
+      return res.status(404).json({ message: 'کاربر یافت نشد' });
+    }
 
-// })
-// router.get("/resetPassword" , async(req , res)=>{
-//   const {id , token} = req.query
-//       const user = await userM.findOne({_id:id});
-//       if(!user){
-//           res.status(400).send("کاربر موجود نیست");
-//       }else{
-//         try{
-//           const oneTimeSecret = process.env.TOKEN_SECRET_RESETPASSWORD + user.password;
-//           const payload = jwt.verify(token , oneTimeSecret);
-//           res.status(200).send('success');
-//         }catch{
-//           res.status(403).send('لینک باطل شده است');
-//         }
+    const now  = new Date();
+    const auth = user.auth || {};
 
-//       }
-    
-// })
-// router.post("/updatePassword" , async(req , res)=>{
-//   const {id , token , password} = req.body;
-//   const pass= {password:req.body.password};
-//   const error =  passwordChecker.validate(pass);
-//   if(error.error){
-//     console.log(error.error);
-//      res.status(400).send(error.error.details[0].message);
-//   }else{
-//     const user = await userM.findOne({_id:id});
-//     const hashedPassword  = user.password;
-//     if(!user){
-//         res.status(400).send("خطا");
-//     }else{
-//       try{
-//         const oneTimeSecret = process.env.TOKEN_SECRET_RESETPASSWORD + user.password;
-//         const payload = jwt.verify(token , oneTimeSecret);
-  
-//         const validPassword = await bcrypt.compare(password , user.password);
-//         if(validPassword === true){
-//           res.status(403).send('کلمه عبور تکراری است');
-//         }else if(validPassword === false){
-//           const salt = await bcrypt.genSalt(10);
-//           const hashPassword = await bcrypt.hash(password , salt);
-//           const response =await userM.updateOne({_id:id} , {password:hashPassword ,$push: { oldPasswords: hashedPassword}});
-//           res.status(200).send("کلمه عبور بروز شد");
-//         }
-//       }catch(err){
-//         res.status(403).send('لینک باطل شده است');
-//       }
-  
-//     }
-//   } 
+    // ① Lockout check
+    if (auth.lockedUntil && auth.lockedUntil > now) {
+      const remainingMin = Math.ceil((auth.lockedUntil - now) / 60000);
+      return res.status(423).json({
+        message: `حساب قفل شده است. ${remainingMin} دقیقه دیگر تلاش کنید`,
+        lockedUntil: auth.lockedUntil,
+      });
+    }
 
-// })
+    // ② OTP must exist and not be expired
+    if (!auth.otpHash || !auth.otpExpiresAt) {
+      return res.status(400).json({ message: 'ابتدا درخواست کد ارسال کنید' });
+    }
+    if (new Date(auth.otpExpiresAt) < now) {
+      return res.status(400).json({ message: 'کد منقضی شده است، لطفاً کد جدید دریافت کنید' });
+    }
 
+    // ③ Compare OTP
+    const valid = await bcrypt.compare(String(otp), auth.otpHash);
 
+    if (!valid) {
+      const newFailCount = (auth.failedOtpAttempts || 0) + 1;
 
+      if (newFailCount >= MAX_VERIFY_FAILS) {
+        // Lock the account for 2 hours
+        const lockedUntil = new Date(now.getTime() + LOCKOUT_DURATION);
+        await userM.updateOne(
+          { _id: user._id },
+          {
+            $set: {
+              'auth.failedOtpAttempts': 0,
+              'auth.lockedUntil':       lockedUntil,
+            },
+          }
+        );
+        return res.status(423).json({
+          message: 'تعداد تلاش‌های ناموفق بیش از حد. حساب به مدت ۲ ساعت قفل شد',
+          lockedUntil,
+        });
+      }
 
+      await userM.updateOne(
+        { _id: user._id },
+        { $set: { 'auth.failedOtpAttempts': newFailCount } }
+      );
+      const attemptsLeft = MAX_VERIFY_FAILS - newFailCount;
+      return res.status(400).json({ message: 'کد اشتباه است', attemptsLeft });
+    }
 
+    // ④ SUCCESS — clear all OTP + lockout state
+    await userM.updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          'auth.otpHash':           null,
+          'auth.otpExpiresAt':      null,
+          'auth.failedOtpAttempts': 0,
+          'auth.lockedUntil':       null,
+        },
+      }
+    );
+
+    return issueTokens(user, res);
+
+  } catch (err) {
+    return res.status(500).json({ message: 'خطای سرور' });
+  }
+});
+
+// ── POST /auth/register ───────────────────────────────────────────────────────
+router.post('/register', upload.single('images'), verify, async (req, res) => {
+  try {
+    const existing = await userM.findOne({ phoneNumber: req.body.phoneNumber });
+    if (existing) {
+      return res.status(400).json({ message: 'شماره تلفن تکراری است' });
+    }
+    const newUser = new userM({
+      firstName:    req.body.firstName,
+      lastName:     req.body.lastName,
+      phoneNumber:  req.body.phoneNumber,
+      profileImage: req.file,
+      validation:   false,
+      access:       req.body.access || [],
+    });
+    const saved = await newUser.save();
+    return res.status(200).json(saved);
+  } catch (err) {
+    return res.status(400).json({ message: err.message });
+  }
+});
+
+// ── POST /auth/login — DEPRECATED (password login replaced by OTP) ────────────
+// router.post('/login', async (req, res) => { ... bcrypt.compare ... });
+
+// ── POST /auth/refreshToken — UNCHANGED ───────────────────────────────────────
+router.post('/refreshToken', (req, res) => {
+  if (!req.cookies.refreshToken) {
+    return res.status(401).json({ message: 'در دسترس نیست' });
+  }
+  jwt.verify(req.cookies.refreshToken, process.env.TOKEN_SECRET_REF, (error, user) => {
+    if (error) {
+      return res.status(401).json({ message: 'در دسترس نیست' });
+    }
+    const accessToken = jwt.sign(
+      {
+        id:           user.id,
+        firstName:    user.firstName,
+        profileImage: user.profileImage,
+        lastName:     user.lastName,
+        access:       user.access,
+        filterMemory: user.filterMemory,
+      },
+      process.env.TOKEN_SECRET,
+      { expiresIn: '3m' }
+    );
+    return res.status(200).json({ accessToken });
+  });
+});
+
+// ── POST /auth/deleteRefreshToken — UNCHANGED (logout) ───────────────────────
+router.post('/deleteRefreshToken', (req, res) => {
+  res.status(200).clearCookie('refreshToken').json({ message: 'logged out' });
+});
+
+// ── POST /auth/updateUser — kept until Session 23 user-management routes ship ─
+router.post('/updateUser', upload.single('images'), verify, async (req, res) => {
+  try {
+    const update = {
+      firstName: req.body.firstName,
+      lastName:  req.body.lastName,
+      access:    req.body.access || [],
+    };
+    if (req.file) update.profileImage = req.file;
+    await userM.findOneAndUpdate({ _id: req.body.userId }, { $set: update });
+    return res.status(200).json({ message: 'user updated' });
+  } catch (err) {
+    return res.status(500).json({ message: 'خطای سرور' });
+  }
+});
 
 module.exports = router;

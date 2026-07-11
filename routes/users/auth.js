@@ -133,7 +133,7 @@ async function sendOtpViaSmsIr(mobile, otp) {
 router.post('/requestOtp', async (req, res) => {
   const { phoneNumber } = req.body;
   if (!phoneNumber) {
-    return res.status(400).json({ message: 'شماره تلفن را وارد کنید' });
+    return res.status(400).json({ message: 'Enter your phone number' });
   }
 
   // ① Per-IP throttle (checked before DB hit)
@@ -141,17 +141,17 @@ router.post('/requestOtp', async (req, res) => {
   const ipBlockedMin = checkAndRecordIp(clientIp);
   if (ipBlockedMin !== null) {
     return res.status(429).json({
-      message: `تعداد درخواست‌ها بیش از حد مجاز. ${ipBlockedMin} دقیقه دیگر تلاش کنید`,
+      message: `Too many requests. Try again in ${ipBlockedMin} minutes`,
     });
   }
 
   try {
     const user = await userM.findOne({ phoneNumber, deleteDate: null });
     if (!user) {
-      return res.status(404).json({ message: 'کاربر یافت نشد' });
+      return res.status(404).json({ message: 'User not found' });
     }
     if (user.validation !== true) {
-      return res.status(403).json({ message: 'حساب کاربری فعال نیست' });
+      return res.status(403).json({ message: 'Account is not active' });
     }
 
     const now  = new Date();
@@ -161,7 +161,7 @@ router.post('/requestOtp', async (req, res) => {
     if (auth.lockedUntil && auth.lockedUntil > now) {
       const remainingMin = Math.ceil((auth.lockedUntil - now) / 60000);
       return res.status(423).json({
-        message: `حساب قفل شده است. ${remainingMin} دقیقه دیگر تلاش کنید`,
+        message: `Account is locked. Try again in ${remainingMin} minutes`,
         lockedUntil: auth.lockedUntil,
       });
     }
@@ -172,7 +172,7 @@ router.post('/requestOtp', async (req, res) => {
       if (msSinceLast < COOLDOWN_MS) {
         const remainingS = Math.ceil((COOLDOWN_MS - msSinceLast) / 1000);
         return res.status(429).json({
-          message: `${remainingS} ثانیه دیگر تلاش کنید`,
+          message: `Try again in ${remainingS} seconds`,
           cooldownSeconds: remainingS,
         });
       }
@@ -186,7 +186,7 @@ router.post('/requestOtp', async (req, res) => {
         (PHONE_WINDOW_MS - (now - new Date(auth.otpWindowStart))) / 60000
       );
       return res.status(429).json({
-        message: `حداکثر تعداد ارسال در این بازه زمانی. ${remainingMin} دقیقه دیگر تلاش کنید`,
+        message: `Send limit reached for this period. Try again in ${remainingMin} minutes`,
       });
     }
 
@@ -217,13 +217,13 @@ router.post('/requestOtp', async (req, res) => {
       crashLogger.logError(smsErr, { type: 'smsIrError', phoneNumber });
       // DEV: don't block login if SMS fails — OTP is in the console above
       // TODO: restore the 502 return below when sms.ir is confirmed working
-      // return res.status(502).json({ message: 'ارسال کد ناموفق بود، لطفاً دوباره امتحان کنید' });
+      // return res.status(502).json({ message: 'Failed to send the code — please try again' });
     }
 
-    return res.status(200).json({ message: 'کد تأیید ارسال شد' });
+    return res.status(200).json({ message: 'Verification code sent' });
 
   } catch (err) {
-    return res.status(500).json({ message: 'خطای سرور' });
+    return res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -231,13 +231,13 @@ router.post('/requestOtp', async (req, res) => {
 router.post('/verifyOtp', async (req, res) => {
   const { phoneNumber, otp } = req.body;
   if (!phoneNumber || !otp) {
-    return res.status(400).json({ message: 'اطلاعات ناقص است' });
+    return res.status(400).json({ message: 'Missing required fields' });
   }
 
   try {
     const user = await userM.findOne({ phoneNumber, deleteDate: null });
     if (!user) {
-      return res.status(404).json({ message: 'کاربر یافت نشد' });
+      return res.status(404).json({ message: 'User not found' });
     }
 
     const now  = new Date();
@@ -247,17 +247,17 @@ router.post('/verifyOtp', async (req, res) => {
     if (auth.lockedUntil && auth.lockedUntil > now) {
       const remainingMin = Math.ceil((auth.lockedUntil - now) / 60000);
       return res.status(423).json({
-        message: `حساب قفل شده است. ${remainingMin} دقیقه دیگر تلاش کنید`,
+        message: `Account is locked. Try again in ${remainingMin} minutes`,
         lockedUntil: auth.lockedUntil,
       });
     }
 
     // ② OTP must exist and not be expired
     if (!auth.otpHash || !auth.otpExpiresAt) {
-      return res.status(400).json({ message: 'ابتدا درخواست کد ارسال کنید' });
+      return res.status(400).json({ message: 'Request a code first' });
     }
     if (new Date(auth.otpExpiresAt) < now) {
-      return res.status(400).json({ message: 'کد منقضی شده است، لطفاً کد جدید دریافت کنید' });
+      return res.status(400).json({ message: 'Code expired — request a new one' });
     }
 
     // ③ Compare OTP
@@ -279,7 +279,7 @@ router.post('/verifyOtp', async (req, res) => {
           }
         );
         return res.status(423).json({
-          message: 'تعداد تلاش‌های ناموفق بیش از حد. حساب به مدت ۲ ساعت قفل شد',
+          message: 'Too many failed attempts. Account locked for 2 hours',
           lockedUntil,
         });
       }
@@ -289,7 +289,7 @@ router.post('/verifyOtp', async (req, res) => {
         { $set: { 'auth.failedOtpAttempts': newFailCount } }
       );
       const attemptsLeft = MAX_VERIFY_FAILS - newFailCount;
-      return res.status(400).json({ message: 'کد اشتباه است', attemptsLeft });
+      return res.status(400).json({ message: 'Incorrect code', attemptsLeft });
     }
 
     // ④ SUCCESS — clear all OTP + lockout state
@@ -308,7 +308,7 @@ router.post('/verifyOtp', async (req, res) => {
     return issueTokens(user, res);
 
   } catch (err) {
-    return res.status(500).json({ message: 'خطای سرور' });
+    return res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -317,7 +317,7 @@ router.post('/register', upload.single('images'), verify, async (req, res) => {
   try {
     const existing = await userM.findOne({ phoneNumber: req.body.phoneNumber });
     if (existing) {
-      return res.status(400).json({ message: 'شماره تلفن تکراری است' });
+      return res.status(400).json({ message: 'Phone number already exists' });
     }
     const newUser = new userM({
       firstName:    req.body.firstName,
@@ -340,11 +340,11 @@ router.post('/register', upload.single('images'), verify, async (req, res) => {
 // ── POST /auth/refreshToken — UNCHANGED ───────────────────────────────────────
 router.post('/refreshToken', (req, res) => {
   if (!req.cookies.refreshToken) {
-    return res.status(401).json({ message: 'در دسترس نیست' });
+    return res.status(401).json({ message: 'Not available' });
   }
   jwt.verify(req.cookies.refreshToken, process.env.TOKEN_SECRET_REF, (error, user) => {
     if (error) {
-      return res.status(401).json({ message: 'در دسترس نیست' });
+      return res.status(401).json({ message: 'Not available' });
     }
     const accessToken = jwt.sign(
       {
@@ -379,7 +379,7 @@ router.post('/updateUser', upload.single('images'), verify, async (req, res) => 
     await userM.findOneAndUpdate({ _id: req.body.userId }, { $set: update });
     return res.status(200).json({ message: 'user updated' });
   } catch (err) {
-    return res.status(500).json({ message: 'خطای سرور' });
+    return res.status(500).json({ message: 'Server error' });
   }
 });
 

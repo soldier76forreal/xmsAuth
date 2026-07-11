@@ -18,7 +18,7 @@ var server = require('http').createServer(app);
 // app.use(cors());
 // LAN IPs added for phone/device testing (Ethernet 192.168.1.135, Wi-Fi 192.168.1.132) —
 // the old 10.185.103.82 entry was a VPN adapter address, unreachable from other devices.
-app.use(cors({credentials: true, origin:['http://localhost:3000' , 'https://localhost:3003' , 'http://192.168.1.135:3000', 'http://192.168.1.132:3000']}));
+app.use(cors({credentials: true, origin:['http://localhost:3000' , 'https://localhost:3003' , 'http://192.168.1.135:3000', 'http://192.168.1.132:3000','http://192.168.1.9:3000']}));
 //dotenv middlewear
 
 dotenv.config();

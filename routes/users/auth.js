@@ -21,6 +21,7 @@ const IP_WINDOW_MS      = 30  * 60 * 1000;   // 30-min rolling window (per IP)
 const IP_MAX_SENDS      = 5;                  // max sends per window (per IP)
 const LOCKOUT_DURATION  = 2   * 60 * 60 * 1000;  // 2h lockout after 5 failed verifies
 const MAX_VERIFY_FAILS  = 5;
+const MAX_PASSWORD_FAILS = 10;                    // password fallback gets 10 attempts (Pouriya, 2026-07-11)
 
 // ── Per-IP in-memory send throttle ───────────────────────────────────────────
 // Resets on server restart — acceptable since IP windows are 30 min.
@@ -334,8 +335,95 @@ router.post('/register', upload.single('images'), verify, async (req, res) => {
   }
 });
 
-// ── POST /auth/login — DEPRECATED (password login replaced by OTP) ────────────
-// router.post('/login', async (req, res) => { ... bcrypt.compare ... });
+// ── POST /auth/loginPassword — password FALLBACK (reinstated 2026-07-11) ──────
+// For users who can't receive the OTP SMS. Same restrictions as the OTP path —
+// active-account check + the SAME shared lockout (auth.lockedUntil, so a locked
+// account is locked for BOTH methods) — but with a 10-attempt limit instead of
+// OTP's 5. Token issuance is identical to verifyOtp.
+router.post('/loginPassword', async (req, res) => {
+  const { phoneNumber, password } = req.body;
+  if (!phoneNumber || !password) {
+    return res.status(400).json({ message: 'Missing required fields' });
+  }
+
+  try {
+    const user = await userM.findOne({ phoneNumber, deleteDate: null });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    if (user.validation !== true) {
+      return res.status(403).json({ message: 'Account is not active' });
+    }
+
+    const now  = new Date();
+    const auth = user.auth || {};
+
+    // ① Shared lockout check (same lock as OTP)
+    if (auth.lockedUntil && auth.lockedUntil > now) {
+      const remainingMin = Math.ceil((auth.lockedUntil - now) / 60000);
+      return res.status(423).json({
+        message: `Account is locked. Try again in ${remainingMin} minutes`,
+        lockedUntil: auth.lockedUntil,
+      });
+    }
+
+    // ② Account must actually have a password (users created after the OTP
+    // migration may not — they can only use OTP until one is set)
+    if (!user.password) {
+      return res.status(400).json({
+        message: 'No password is set for this account — sign in with the code instead',
+      });
+    }
+
+    // ③ Compare password
+    const valid = await bcrypt.compare(String(password), user.password);
+
+    if (!valid) {
+      const newFailCount = (auth.failedPasswordAttempts || 0) + 1;
+
+      if (newFailCount >= MAX_PASSWORD_FAILS) {
+        const lockedUntil = new Date(now.getTime() + LOCKOUT_DURATION);
+        await userM.updateOne(
+          { _id: user._id },
+          {
+            $set: {
+              'auth.failedPasswordAttempts': 0,
+              'auth.lockedUntil':            lockedUntil,
+            },
+          }
+        );
+        return res.status(423).json({
+          message: 'Too many failed attempts. Account locked for 2 hours',
+          lockedUntil,
+        });
+      }
+
+      await userM.updateOne(
+        { _id: user._id },
+        { $set: { 'auth.failedPasswordAttempts': newFailCount } }
+      );
+      const attemptsLeft = MAX_PASSWORD_FAILS - newFailCount;
+      return res.status(400).json({ message: 'Incorrect password', attemptsLeft });
+    }
+
+    // ④ SUCCESS — clear failure counters + lockout (both methods)
+    await userM.updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          'auth.failedPasswordAttempts': 0,
+          'auth.failedOtpAttempts':      0,
+          'auth.lockedUntil':            null,
+        },
+      }
+    );
+
+    return issueTokens(user, res);
+
+  } catch (err) {
+    return res.status(500).json({ message: 'Server error' });
+  }
+});
 
 // ── POST /auth/refreshToken — UNCHANGED ───────────────────────────────────────
 router.post('/refreshToken', (req, res) => {

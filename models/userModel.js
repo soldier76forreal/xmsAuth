@@ -19,7 +19,10 @@ const userSchema = new mongoose.Schema({
     otpSendCount:      { type: Number, default: 0    },  // sends in current window
     otpWindowStart:    { type: Date,   default: null },  // start of send-throttle window
     failedOtpAttempts: { type: Number, default: 0    },  // wrong-code counter
-    lockedUntil:       { type: Date,   default: null },  // 5 fails → now + 2h
+    // Password fallback (reinstated 2026-07-11) — its own counter, 10-attempt
+    // limit; shares lockedUntil with OTP so a locked account is locked for both.
+    failedPasswordAttempts: { type: Number, default: 0 },
+    lockedUntil:       { type: Date,   default: null },  // OTP: 5 fails / password: 10 fails → now + 2h
   },
 
   // ── Presence (Phase 4 — updated by Socket.io) ─────────────────────────────

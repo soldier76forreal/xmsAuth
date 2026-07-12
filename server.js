@@ -15,10 +15,12 @@ patchExpressRouter(express);
 //express middlewear
 const app = express();
 var server = require('http').createServer(app);
-// app.use(cors());
-// LAN IPs added for phone/device testing (Ethernet 192.168.1.135, Wi-Fi 192.168.1.132) —
-// the old 10.185.103.82 entry was a VPN adapter address, unreachable from other devices.
-app.use(cors({credentials: true, origin:['http://localhost:3000' , 'https://localhost:3003' , 'http://192.168.1.135:3000', 'http://192.168.1.132:3000','http://192.168.1.9:3000']}));
+// Production origins (launched 2026-07-12) + localhost for development.
+app.use(cors({credentials: true, origin:[
+  'https://xms.lazulitemarble.com',
+  'https://api.lazulitemarble.com',
+  'http://localhost:3000',            // local dev only
+]}));
 //dotenv middlewear
 
 dotenv.config();
@@ -64,7 +66,9 @@ process.on("uncaughtException", (error) => {
     console.error(`Uncaught exception logged: ${crashId}`, error);
 });
 
-server.listen(3002 , connect =>{
-    console.log("server running on port 3002.");
+// Port 7256 (changed from 3002 for the 2026-07-12 launch) — the reverse proxy
+// maps https://auth.lazulitemarble.com onto this local port.
+server.listen(7256 , connect =>{
+    console.log("server running on port 7256.");
 })
 

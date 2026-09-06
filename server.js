@@ -15,10 +15,11 @@ patchExpressRouter(express);
 //express middlewear
 const app = express();
 var server = require('http').createServer(app);
-// Production origins (launched 2026-07-12) + localhost for development.
+// Production origins (DamoonCars re-scope, 2026-09-06 — placeholder domains,
+// update once the real DamoonCars domain is registered) + localhost for dev.
 app.use(cors({credentials: true, origin:[
-  'https://xms.lazulitemarble.com',
-  'https://api.lazulitemarble.com',
+  'https://xms.damooncars.com',
+  'https://api.damooncars.com',
   'http://localhost:3000',            // local dev only
 ]}));
 //dotenv middlewear
@@ -66,9 +67,9 @@ process.on("uncaughtException", (error) => {
     console.error(`Uncaught exception logged: ${crashId}`, error);
 });
 
-// Port 7256 (changed from 3002 for the 2026-07-12 launch) — the reverse proxy
-// maps https://auth.lazulitemarble.com onto this local port.
-server.listen(7256 , connect =>{
-    console.log("server running on port 7256.");
+// Port 8256 (DamoonCars re-scope, 2026-09-06 — was 7256) — the reverse proxy
+// maps https://auth.damooncars.com onto this local port.
+server.listen(8256 , connect =>{
+    console.log("server running on port 8256.");
 })
 

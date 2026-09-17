@@ -67,8 +67,12 @@ process.on("uncaughtException", (error) => {
 });
 
 // Port 7256 (changed from 3002 for the 2026-07-12 launch) — the reverse proxy
-// maps https://auth.lazulitemarble.com onto this local port.
-server.listen(7256 , connect =>{
-    console.log("server running on port 7256.");
+// maps https://auth.lazulitemarble.com onto this local port. Configurable via
+// PORT so a local machine can run on something else (e.g. 2681, if 7256 is
+// already taken locally) without ever touching this committed default —
+// production gets 7256 unless its own .env sets PORT, which it shouldn't.
+const PORT = process.env.PORT || 7256;
+server.listen(PORT , connect =>{
+    console.log(`server running on port ${PORT}.`);
 })
 

@@ -13,6 +13,26 @@ const crashLogger  = require('../../utils/crashLogger');
 
 const router = express.Router();
 
+// ── SMS / OTP login: RETIRED ─────────────────────────────────────────────────
+// Password is now the only way in. The OTP implementation below is left intact
+// rather than deleted (the same "disable without deleting" approach as
+// xms/src/tools/featureFlags.js), so switching it back on is this one boolean
+// plus un-hiding the two steps in logIn.js — not a re-implementation.
+//
+// The routes are disabled SERVER-SIDE, not merely hidden in the UI: an endpoint
+// that still issues real tokens is a live authentication path whether or not
+// anything links to it.
+const OTP_LOGIN_ENABLED = false;
+
+// Guard for the two OTP endpoints. 410 Gone rather than 404 — the route exists,
+// the capability has been withdrawn.
+function otpDisabled(res) {
+  return res.status(410).json({
+    message: 'SMS sign-in has been discontinued. Please sign in with your password.',
+    code: 'OTP_DISABLED',
+  });
+}
+
 // ── Rate limit constants ──────────────────────────────────────────────────────
 const COOLDOWN_MS       = 60  * 1000;        // 60s between sends (per phone)
 const PHONE_WINDOW_MS   = 30  * 60 * 1000;   // 30-min rolling window (per phone)
@@ -132,6 +152,7 @@ async function sendOtpViaSmsIr(mobile, otp) {
 
 // ── POST /auth/requestOtp ─────────────────────────────────────────────────────
 router.post('/requestOtp', async (req, res) => {
+  if (!OTP_LOGIN_ENABLED) return otpDisabled(res);
   const { phoneNumber } = req.body;
   if (!phoneNumber) {
     return res.status(400).json({ message: 'Enter your phone number' });
@@ -230,6 +251,7 @@ router.post('/requestOtp', async (req, res) => {
 
 // ── POST /auth/verifyOtp ──────────────────────────────────────────────────────
 router.post('/verifyOtp', async (req, res) => {
+  if (!OTP_LOGIN_ENABLED) return otpDisabled(res);
   const { phoneNumber, otp } = req.body;
   if (!phoneNumber || !otp) {
     return res.status(400).json({ message: 'Missing required fields' });
@@ -369,9 +391,13 @@ router.post('/loginPassword', async (req, res) => {
 
     // ② Account must actually have a password (users created after the OTP
     // migration may not — they can only use OTP until one is set)
+    // No password on file. With SMS sign-in retired there is no self-service
+    // route back in, so this has to send them to an administrator rather than
+    // to the OTP flow it used to point at.
     if (!user.password) {
       return res.status(400).json({
-        message: 'No password is set for this account — sign in with the code instead',
+        message: 'No password is set for this account. Ask an administrator to set one for you.',
+        code: 'NO_PASSWORD_SET',
       });
     }
 

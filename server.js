@@ -16,11 +16,24 @@ patchExpressRouter(express);
 const app = express();
 var server = require('http').createServer(app);
 // Production origins (launched 2026-07-12) + localhost for development.
-app.use(cors({credentials: true, origin:[
+// The local entry is port-agnostic: the dev server's port is not fixed (CRA
+// moves it when one is taken, and this machine's ephemeral range forced ours
+// above 60000), and pinning :3000 here produced silent CORS failures. Mirrors
+// isLocalHost() in the frontend's axiosGlobalUrl.js.
+const PROD_ORIGINS = [
   'https://xms.lazulitemarble.com',
   'https://api.lazulitemarble.com',
-  'http://localhost:3000',            // local dev only
-]}));
+];
+const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d+)?$/;
+
+app.use(cors({
+  credentials: true,
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);           // curl / server-to-server
+    if (PROD_ORIGINS.includes(origin) || LOCAL_ORIGIN.test(origin)) return callback(null, true);
+    return callback(new Error('Not allowed by CORS'));
+  },
+}));
 //dotenv middlewear
 
 dotenv.config();

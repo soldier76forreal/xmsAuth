@@ -79,12 +79,14 @@ process.on("uncaughtException", (error) => {
     console.error(`Uncaught exception logged: ${crashId}`, error);
 });
 
-// Port 7256 (changed from 3002 for the 2026-07-12 launch) — the reverse proxy
-// maps https://auth.lazulitemarble.com onto this local port. Configurable via
-// PORT so a local machine can run on something else (e.g. 2681, if 7256 is
-// already taken locally) without ever touching this committed default —
-// production gets 7256 unless its own .env sets PORT, which it shouldn't.
-const PORT = process.env.PORT || 7256;
+// Port 2681 — the reverse proxy maps https://auth.lazulitemarble.com onto this
+// local port. This is the PRODUCTION default, confirmed by Pouriya against the
+// live host on 2026-10-11.
+//
+// It used to say 7256 here and treated 2681 as a local-only choice — backwards,
+// the same way api/server.js had it. PORT still overrides, which is how local
+// dev runs on 60256.
+const PORT = process.env.PORT || 2681;
 server.listen(PORT , connect =>{
     console.log(`server running on port ${PORT}.`);
 })
